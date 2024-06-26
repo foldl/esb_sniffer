@@ -20,7 +20,7 @@ here are detailed steps to build it with MinGW64 which will turn out to be much 
 
 * Folder [_libusb_](libusb) contains header file of [libusb](https://github.com/libusb/libusb/releases/tag/v1.0.27);
 
-    Extract `libusb.dll` for MinGW64 to this folder.
+    Extract `libusb.dll` for MinGW64 to root directory of this project.
 
 Steps to build:
 
