@@ -613,8 +613,13 @@ public:
             if (air_crc == cal_crc)
             {
                 disp_hex(addr, addr_byte_len, false);
-                printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
-                disp_hex(payload, len);
+                if (len > 0)
+                {
+                    printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
+                    disp_hex(payload, len);
+                }
+                else
+                    printf(": PID=%d NO_ACK=%d ACK\n", pid, no_ack);
             }
             else
             {
@@ -723,7 +728,7 @@ void usage(const std::string &prog)
               << "  -h, --help                      show this help message and exit\n"
               << "BASIC:\n"
               << "  -f, --freq_hz F                 frequency in Hz. default: 2042M\n"
-              << "                                  k/M/G suffix are supported, such as 2042M, 2.042G.\n"
+              << "                                  k/M/G suffices are supported, such as 2042M, 2.042G.\n"
               << "  --sample_rate R                 sample rate in MHz ({1, 2}). default: 2(MHz)\n"
               << "  --addr_byte_len LEN             address length in bytes ({3, 4, 5}). default: 5\n"
               << "  --payload_len_bit_len LEN       payload length field length in bits ({6, 8}). default: 6\n"
