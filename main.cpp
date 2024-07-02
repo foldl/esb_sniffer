@@ -554,106 +554,48 @@ static uint8_t crc_8(uint8_t *addr, uint32_t num, uint8_t init, uint16_t poly)
 
 #define MHz 1000000ul
 
-class ESBDecoder
+class Decoder
 {
 public:
-    ESBDecoder(int addr_byte_len = 5, int payload_len_bit_len = 6, int crc_byte_len = 2, bool verbose = false)
+    Decoder(int addr_byte_len, int crc_byte_len, bool verbose)
         : sync55(0x55), syncAA(0xAA),
           addr_byte_len(addr_byte_len),
-          payload_len_bit_len(payload_len_bit_len),
           crc_byte_len(crc_byte_len),
           verbose(verbose)
+    {}
+
+    virtual void decode(const iq_comp_t *rxp_in, int buf_len) = 0;
+
+    virtual bool ignore_addr(const uint8_t *addr, int len)
     {
-    }
+        if (len > (int)addr_filter.size()) len = (int)addr_filter.size();
+        if (len > (int)filter_mask.size()) len = (int)filter_mask.size();
 
-    void decode(const iq_comp_t *rxp_in, int buf_len)
-    {
-        const iq_comp_t *rxp = rxp_in;
-
-        const int total_symbol = buf_len / (SAMPLE_PER_SYMBOL * 2); // 2 for IQ
-        int num_symbol_left = total_symbol;
-
-        while (num_symbol_left > MAX_OVERLAP_SAMPLE)
+        for (int i = 0; i < len; i++)
         {
-            int hit_idx = sync(rxp, num_symbol_left);
-            if (hit_idx == -1)
-                break;
-
-            rxp += hit_idx + sync55.get_num_sync_bits() * 2 * SAMPLE_PER_SYMBOL; // move to beginning of PDU header
-            const iq_comp_t *pkt_start = rxp;
-
-            dem_byte(rxp, addr_byte_len + 2, addr);
-            rxp += addr_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
-
-            uint32_t acc = *(uint32_t *)addr;
-
-            uint32_t payload_len = 0;
-            uint32_t pid = 0;
-            uint32_t no_ack = 0;
-
-            dem_bits(rxp, payload_len_bit_len, payload_len);
-            rxp += payload_len_bit_len * SAMPLE_PER_SYMBOL * 2;
-
-            dem_bits(rxp, 2, pid);
-            rxp += 2 * SAMPLE_PER_SYMBOL * 2;
-
-            dem_bits(rxp, 1, no_ack);
-            rxp += 1 * SAMPLE_PER_SYMBOL * 2;
-
-            uint8_t len = payload_len;
-
-            uint8_t crc_value[2] = {0};
-            dem_byte(rxp, len, payload);
-            rxp += len * 8 * SAMPLE_PER_SYMBOL * 2;
-            dem_byte(rxp, crc_byte_len, crc_value);
-            rxp += crc_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
-
-            uint16_t air_crc = crc_byte_len == 2 ? (crc_value[0] << 8) | crc_value[1] : crc_value[0];
-            uint16_t cal_crc = calc_crc(addr, len, (uint8_t)pid, (uint8_t)no_ack, payload);
-            if (air_crc == cal_crc)
-            {
-                disp_hex(addr, addr_byte_len, false);
-                if (len > 0)
-                {
-                    printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
-                    disp_hex(payload, len);
-                }
-                else
-                    printf(": PID=%d NO_ACK=%d ACK\n", pid, no_ack);
-            }
-            else
-            {
-                if (verbose)
-                {
-                    printf("BAD: ");
-                    disp_hex(addr, addr_byte_len, false);
-                    printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
-                    disp_hex(payload, len, false);
-                    printf(" CRC %04x <> %04x\n", air_crc, cal_crc);
-                }
-                rxp = pkt_start;
-            }
-
-            num_symbol_left = total_symbol - (rxp - rxp_in) / (SAMPLE_PER_SYMBOL * 2);
+            if ((addr[i] & filter_mask[i]) != (addr_filter[i] & filter_mask[i]))
+                return true;
         }
+        return false;
     }
+
+public:
+    std::vector<uint8_t> addr_filter;
+    std::vector<uint8_t> filter_mask;
 
 protected:
     PhaseSync<8, SAMPLE_PER_SYMBOL> sync55;
     PhaseSync<8, SAMPLE_PER_SYMBOL> syncAA;
     const int addr_byte_len;       // [3,5]
-    const int payload_len_bit_len; // {6, 8}
     const int crc_byte_len;        // {0, 1, 2}
     const bool verbose;
 
     uint8_t addr[10];
-    uint8_t payload[300]; // payload and crc
 
     CRC<uint8_t, 0x7> crc8;
     CRC<uint16_t, 0x1021> crc16;
 
 protected:
-
     int sync(PhaseSync<8, SAMPLE_PER_SYMBOL> &syncer, const iq_comp_t *rxp, const int search_len_in_symbol, uint32_t expected_addr_bit)
     {
         int hit = syncer.sync(rxp, search_len_in_symbol);
@@ -679,17 +621,21 @@ protected:
         return hit55 < hitAA ? hit55 : hitAA;
     }
 
-    uint16_t calc_crc(const uint8_t *addr, uint8_t len, uint8_t pid, uint8_t no_ack, const uint8_t *payload)
+    uint16_t calc_crc(const uint8_t *addr,
+                      uint32_t field1, int bit_len1,
+                      uint32_t field2, int bit_len2,
+                      uint32_t field3, int bit_len3,
+                      int payload_len, const uint8_t *payload)
     {
         if (crc_byte_len == 2)
         {
             auto &crc = crc16;
             crc.restart(0xffff);
             crc.update(addr, addr_byte_len);
-            crc.update(len, payload_len_bit_len);
-            crc.update(pid, 2);
-            crc.update(no_ack, 1);
-            crc.update(payload, len);
+            crc.update(field1, bit_len1);
+            crc.update(field2, bit_len2);
+            crc.update(field3, bit_len3);
+            crc.update(payload, payload_len);
             return crc.get_result();
         }
         else
@@ -697,20 +643,313 @@ protected:
             auto &crc = crc8;
             crc.restart(0xff);
             crc.update(addr, addr_byte_len);
-            crc.update(len, payload_len_bit_len);
-            crc.update(pid, 2);
-            crc.update(no_ack, 1);
-            crc.update(payload, len);
+            crc.update(field1, bit_len1);
+            crc.update(field2, bit_len2);
+            crc.update(field3, bit_len3);
+            crc.update(payload, payload_len);
             return crc.get_result();
         }
     }
+
 };
+
+class SBDecoder : public Decoder
+{
+public:
+    SBDecoder(int addr_byte_len, int payload_len, int crc_byte_len, bool verbose)
+        : Decoder(addr_byte_len, crc_byte_len, verbose),
+          payload_len(payload_len)
+    {
+    }
+
+    void decode(const iq_comp_t *rxp_in, int buf_len) override
+    {
+        const iq_comp_t *rxp = rxp_in;
+
+        const int total_symbol = buf_len / (SAMPLE_PER_SYMBOL * 2); // 2 for IQ
+        int num_symbol_left = total_symbol;
+
+        while (num_symbol_left > MAX_OVERLAP_SAMPLE)
+        {
+            int hit_idx = sync(rxp, num_symbol_left);
+            if (hit_idx == -1)
+                break;
+
+            uint8_t crc_value[2] = {0};
+
+            rxp += hit_idx + sync55.get_num_sync_bits() * 2 * SAMPLE_PER_SYMBOL; // move to beginning of PDU header
+            const iq_comp_t *pkt_start = rxp;
+
+            dem_byte(rxp, addr_byte_len, addr);
+            rxp += addr_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
+
+            dem_byte(rxp, payload_len, payload);
+            rxp += payload_len * 8 * SAMPLE_PER_SYMBOL * 2;
+            dem_byte(rxp, crc_byte_len, crc_value);
+            rxp += crc_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
+
+            uint16_t air_crc = crc_byte_len == 2 ? (crc_value[0] << 8) | crc_value[1] : crc_value[0];
+            uint16_t cal_crc = calc_crc(addr, payload_len, payload);
+
+            if (air_crc != cal_crc)
+                rxp = pkt_start;
+            num_symbol_left = total_symbol - (rxp - rxp_in) / (SAMPLE_PER_SYMBOL * 2);
+
+            if (ignore_addr(addr, addr_byte_len))
+                continue;
+
+            if (air_crc == cal_crc)
+            {
+                disp_hex(addr, addr_byte_len, false);
+                printf(": LEN=%03d DATA=", payload_len);
+                disp_hex(payload, payload_len);
+            }
+            else
+            {
+                if (verbose)
+                {
+                    uint8_t filter[] = {0xe7, 0xe7, 0xe7, 0xe7, 0xab};
+                    if (memcmp(filter, addr, addr_byte_len) == 0)
+                    {
+                        printf("BAD: ");
+                        disp_hex(addr, addr_byte_len, false);
+                        printf(": LEN=%03d DATA=", payload_len);
+                        disp_hex(payload, payload_len, false);
+                        printf(" CRC %04x <> %04x\n", air_crc, cal_crc);
+                    }
+                }
+            }
+        }
+    }
+
+protected:
+    const int payload_len;
+
+    uint8_t payload[300]; // payload and crc
+
+protected:
+
+    uint16_t calc_crc(const uint8_t *addr, uint8_t len, const uint8_t *payload)
+    {
+        return Decoder::calc_crc(addr, 0, 0, 0, 0, 0, 0, len, payload);
+    }
+};
+
+class ESBDecoder : public Decoder
+{
+public:
+    ESBDecoder(int addr_byte_len, int payload_len_bit_len, int crc_byte_len, bool verbose)
+        : Decoder(addr_byte_len, crc_byte_len, verbose),
+          payload_len_bit_len(payload_len_bit_len)
+    {
+    }
+
+    void decode(const iq_comp_t *rxp_in, int buf_len) override
+    {
+        const iq_comp_t *rxp = rxp_in;
+
+        const int total_symbol = buf_len / (SAMPLE_PER_SYMBOL * 2); // 2 for IQ
+        int num_symbol_left = total_symbol;
+
+        while (num_symbol_left > MAX_OVERLAP_SAMPLE)
+        {
+            int hit_idx = sync(rxp, num_symbol_left);
+            if (hit_idx == -1)
+                break;
+
+            rxp += hit_idx + sync55.get_num_sync_bits() * 2 * SAMPLE_PER_SYMBOL; // move to beginning of PDU header
+            const iq_comp_t *pkt_start = rxp;
+
+            dem_byte(rxp, addr_byte_len, addr);
+            rxp += addr_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
+
+            uint32_t payload_len = 0;
+            uint32_t pid = 0;
+            uint32_t no_ack = 0;
+
+            dem_bits(rxp, payload_len_bit_len, payload_len);
+            rxp += payload_len_bit_len * SAMPLE_PER_SYMBOL * 2;
+
+            dem_bits(rxp, 2, pid);
+            rxp += 2 * SAMPLE_PER_SYMBOL * 2;
+
+            dem_bits(rxp, 1, no_ack);
+            rxp += 1 * SAMPLE_PER_SYMBOL * 2;
+
+            uint8_t len = payload_len;
+
+            uint8_t crc_value[2] = {0};
+            dem_byte(rxp, len, payload);
+            rxp += len * 8 * SAMPLE_PER_SYMBOL * 2;
+            dem_byte(rxp, crc_byte_len, crc_value);
+            rxp += crc_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
+
+            uint16_t air_crc = crc_byte_len == 2 ? (crc_value[0] << 8) | crc_value[1] : crc_value[0];
+            uint16_t cal_crc = calc_crc(addr, len, (uint8_t)pid, (uint8_t)no_ack, payload);
+
+            if (air_crc != cal_crc)
+                rxp = pkt_start;
+            num_symbol_left = total_symbol - (rxp - rxp_in) / (SAMPLE_PER_SYMBOL * 2);
+
+            if (ignore_addr(addr, addr_byte_len))
+                continue;
+
+            if (air_crc == cal_crc)
+            {
+                disp_hex(addr, addr_byte_len, false);
+                if (len > 0)
+                {
+                    printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
+                    disp_hex(payload, len);
+                }
+                else
+                    printf(": PID=%d NO_ACK=%d ACK\n", pid, no_ack);
+            }
+            else
+            {
+                if (verbose)
+                {
+                    printf("BAD: ");
+                    disp_hex(addr, addr_byte_len, false);
+                    printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
+                    disp_hex(payload, len, false);
+                    printf(" CRC %04x <> %04x\n", air_crc, cal_crc);
+                }
+            }
+        }
+    }
+
+protected:
+    const int payload_len_bit_len; // {6, 8}
+
+    uint8_t payload[300]; // payload and crc
+
+protected:
+
+    uint16_t calc_crc(const uint8_t *addr, uint8_t len, uint8_t pid, uint8_t no_ack, const uint8_t *payload)
+    {
+        return Decoder::calc_crc(addr,
+                                 len, payload_len_bit_len,
+                                 pid, 2,
+                                 no_ack, 1,
+                                 len, payload);
+    }
+};
+
+class FixedESBDecoder : public ESBDecoder
+{
+public:
+    FixedESBDecoder(int addr_byte_len, int payload_len_bit_len, int payload_len, int crc_byte_len, bool verbose)
+        : ESBDecoder(addr_byte_len, payload_len_bit_len, crc_byte_len, verbose),
+          payload_len(payload_len)
+    {
+    }
+
+    void decode(const iq_comp_t *rxp_in, int buf_len) override
+    {
+        const iq_comp_t *rxp = rxp_in;
+
+        const int total_symbol = buf_len / (SAMPLE_PER_SYMBOL * 2); // 2 for IQ
+        int num_symbol_left = total_symbol;
+
+        while (num_symbol_left > MAX_OVERLAP_SAMPLE)
+        {
+            int hit_idx = sync(rxp, num_symbol_left);
+            if (hit_idx == -1)
+                break;
+
+            uint8_t crc_value[2] = {0};
+
+            rxp += hit_idx + sync55.get_num_sync_bits() * 2 * SAMPLE_PER_SYMBOL; // move to beginning of PDU header
+            const iq_comp_t *pkt_start = rxp;
+
+            dem_byte(rxp, addr_byte_len, addr);
+            rxp += addr_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
+
+            uint32_t payload_len_air = 0;
+            uint32_t pid = 0;
+            uint32_t no_ack = 0;
+
+            dem_bits(rxp, payload_len_bit_len, payload_len_air);
+            rxp += payload_len_bit_len * SAMPLE_PER_SYMBOL * 2;
+
+            dem_bits(rxp, 2, pid);
+            rxp += 2 * SAMPLE_PER_SYMBOL * 2;
+
+            dem_bits(rxp, 1, no_ack);
+            rxp += 1 * SAMPLE_PER_SYMBOL * 2;
+
+            dem_byte(rxp, payload_len, payload);
+            rxp += payload_len * 8 * SAMPLE_PER_SYMBOL * 2;
+            dem_byte(rxp, crc_byte_len, crc_value);
+            rxp += crc_byte_len * 8 * SAMPLE_PER_SYMBOL * 2;
+
+            uint16_t air_crc = crc_byte_len == 2 ? (crc_value[0] << 8) | crc_value[1] : crc_value[0];
+            uint16_t cal_crc = calc_crc(addr, payload_len_air, pid, no_ack, payload_len, payload);
+
+            if (air_crc != cal_crc)
+                rxp = pkt_start;
+            num_symbol_left = total_symbol - (rxp - rxp_in) / (SAMPLE_PER_SYMBOL * 2);
+
+            if (ignore_addr(addr, addr_byte_len))
+                continue;
+
+            if ((air_crc == cal_crc) && (0 == payload_len_air))
+            {
+                disp_hex(addr, addr_byte_len, false);
+                printf(": PID=%d NO_ACK=%d LEN_AIR=%03d DATA=", pid, no_ack, payload_len_air);
+                disp_hex(payload, payload_len);
+            }
+            else
+            {
+                if (verbose)
+                {
+                    uint8_t filter[] = {0xe7, 0xe7, 0xe7, 0xe7, 0xab};
+                    if (memcmp(filter, addr, addr_byte_len) == 0)
+                    {
+                        printf("BAD: ");
+                        disp_hex(addr, addr_byte_len, false);
+                        printf(": PID=%d NO_ACK=%d LEN_AIR=%03d DATA=", pid, no_ack, payload_len_air);
+                        disp_hex(payload, payload_len, false);
+                        printf(" CRC %04x <> %04x\n", air_crc, cal_crc);
+                    }
+                }
+            }
+        }
+    }
+
+protected:
+    const int payload_len;
+
+    uint8_t payload[300]; // payload and crc
+
+    uint16_t calc_crc(const uint8_t *addr, uint8_t air_len, uint8_t pid, uint8_t no_ack, uint8_t len, const uint8_t *payload)
+    {
+        return Decoder::calc_crc(addr,
+                                 air_len, payload_len_bit_len,
+                                 pid, 2,
+                                 no_ack, 1,
+                                 len, payload);
+    }
+};
+
+enum protocol
+{
+    SB,
+    ESB,
+};
+
+#define ADDR_MAX_LEN        5
 
 struct Args
 {
-    uint64_t freq_hz = 2402 * MHz;
+    protocol prot = protocol::ESB;
+    int64_t freq_hz = 2402 * MHz;
+    std::vector<uint8_t> addr_filter;
+    std::vector<uint8_t> filter_mask;
     int addr_byte_len = 5;
     int payload_len_bit_len = 6;
+    int payload_len = -1;
     int crc_byte_len = 2;
     int lna_gain = 16;
     int vga_gain = 16;
@@ -727,17 +966,30 @@ void usage(const std::string &prog)
               << "Basic options:\n"
               << "  -h, --help                      show this help message and exit\n"
               << "BASIC:\n"
-              << "  -f, --freq_hz F                 frequency in Hz. default: 2042M\n"
+              << "  -c, --channel CH                ESB/SB channel (0..100). Default: 2\n"
+              << "                                  central frequency = (2040 + ch)MHz\n"
+              << "  -f, --freq_hz F                 central frequency in Hz.\n"
               << "                                  k/M/G suffices are supported, such as 2042M, 2.042G.\n"
               << "  --sample_rate R                 sample rate in MHz ({1, 2}). default: 2(MHz)\n"
+              << "  -p, --protocol PROTO            protocol (SB/ESB). default: ESB\n"
               << "  --addr_byte_len LEN             address length in bytes ({3, 4, 5}). default: 5\n"
-              << "  --payload_len_bit_len LEN       payload length field length in bits ({6, 8}). default: 6\n"
               << "  --crc_byte_len LEN              CRC length in bytes ({1, 2}). default: 2\n"
+              << "SB options:\n"
+              << "  --payload_len LEN               payload length in bytes ([0..255]). default: 32\n"
+              << "ESB options:\n"
+              << "  --payload_len LEN               fixed payload length in bytes ([0..255]). default: -1 (dynamic)\n"
+              << "  --payload_len_bit_len LEN       payload length field length in bits ({6, 8}). default: 6\n"
               << "RF options:\n"
               << "  --lna_gain GAIN                 LNA (IF) gain in dB ([0, 40], step 8). default: 16\n"
               << "  --vga_gain GAIN                 VGA gain in dB ([0, 62], step 2). default: 16\n"
               << "  +amplifier                      enable RF RX/TX amplifiers. default: disabled\n"
-              << "  +verbose                        dump all possible packets.\n";
+              << "Debug options:\n"
+              << "  +verbose                        dump all possible packets.\n"
+              << "  --filter AA:BB:...              filter addresses. (default: not filtered)\n"
+              << "  --mask   CC:DD:...              mask on address filter. (default: FF:FF:...)\n"
+              << "                                  when bit i is given in `filter` and bit i of `mask` is 1,\n"
+              << "                                  bit i of address is tested against filter:\n"
+              << "                                  if not matched, discard it.\n";
 }
 
 static uint64_t parse_freq(const char *s)
@@ -761,6 +1013,30 @@ static uint64_t parse_freq(const char *s)
     return (uint64_t)r;
 }
 
+static uint64_t parse_ch(const char *s)
+{
+    int i = std::stoi(s);
+    return (uint64_t)(2040 + i) * MHz;
+}
+
+static bool parse_addr(std::vector<uint8_t> &addr, std::string s)
+{
+    addr.clear();
+    while (s.size() > 0)
+    {
+        size_t pos = s.find_first_of(':');
+        std::string part = s.substr(0, pos);
+        {
+            uint32_t n = 0;
+            sscanf(part.c_str(), "%x", &n);
+            addr.push_back((uint8_t)n);
+        }
+        if (pos == std::string::npos) break;
+        s = s.substr(pos + 1);
+    }
+    return true;
+}
+
 static size_t parse_args(Args &args, const std::vector<std::string> &argv)
 {
     const size_t argc = argv.size();
@@ -782,12 +1058,20 @@ static size_t parse_args(Args &args, const std::vector<std::string> &argv)
         }
 
     size_t c = 1;
+    bool payload_len_set = false;
 
     try
     {
         while (c < argc)
         {
             const char *arg = argv[c].c_str();
+
+            if (strcmp(arg, "--payload_len") == 0)
+            {
+                payload_len_set = true;
+            }
+            else;
+
             if ((strcmp(arg, "--help") == 0) || (strcmp(arg, "-h") == 0))
             {
                 args.show_help = true;
@@ -800,8 +1084,49 @@ static size_t parse_args(Args &args, const std::vector<std::string> &argv)
             {
                 args.amp_enable = true;
             }
+            else if ((strcmp(arg, "--protocol") == 0) || (strcmp(arg, "-p") == 0))
+            {
+                c++;
+                if (c < argc)
+                {
+                    if (stricmp(argv[c].c_str(), "sb") == 0)
+                    {
+                        args.prot = protocol::SB;
+                        if (!payload_len_set)
+                            args.payload_len = 32;
+                    }
+                    else if (stricmp(argv[c].c_str(), "esb") == 0)
+                    {
+                        args.prot = protocol::ESB;
+                        if (!payload_len_set)
+                            args.payload_len = -1;
+                    }
+                    else
+                        break;
+                }
+            }
+            else if (strcmp(arg, "--filter") == 0)
+            {
+                c++;
+                if (c < argc)
+                {
+                    if (!parse_addr(args.addr_filter, argv[c]))
+                        break;
+                }
+            }
+            else if (strcmp(arg, "--mask") == 0)
+            {
+                c++;
+                if (c < argc)
+                {
+                    if (!parse_addr(args.filter_mask, argv[c]))
+                        break;
+                }
+            }
             handle_param("--freq_hz",               "-f", freq_hz,              parse_freq)
+            handle_param("--channel",               "-c", freq_hz,              parse_ch)
             handle_para0("--addr_byte_len",               addr_byte_len,        std::stoi)
+            handle_para0("--payload_len",                 payload_len,          std::stoi)
             handle_para0("--payload_len_bit_len",         payload_len_bit_len,  std::stoi)
             handle_para0("--crc_byte_len",                crc_byte_len,         std::stoi)
             handle_para0("--sample_rate",                 sample_rate,          std::stoi)
@@ -818,6 +1143,9 @@ static size_t parse_args(Args &args, const std::vector<std::string> &argv)
         std::cerr << e.what() << '\n';
         return c;
     }
+
+    while (args.filter_mask.size() < ADDR_MAX_LEN)
+        args.filter_mask.push_back(0xff);
 
     return c;
 }
@@ -839,9 +1167,10 @@ int main(int argc, char **argv)
 
     if (args.show_help
         || (args.sample_rate < 1) || (args.sample_rate > 2)
-        || (args.addr_byte_len < 3) || (args.addr_byte_len > 5)
+        || (args.addr_byte_len < 3) || (args.addr_byte_len > ADDR_MAX_LEN)
         || (args.crc_byte_len < 1) || (args.crc_byte_len > 2)
-        || (args.payload_len_bit_len < 2)|| (args.payload_len_bit_len > 8))
+        || (args.payload_len_bit_len < 2)|| (args.payload_len_bit_len > 8)
+        || (args.payload_len > 255))
     {
         usage(all_args[0]);
         return 0;
@@ -877,7 +1206,21 @@ int main(int argc, char **argv)
     source.vga_gain = args.vga_gain;
     source.amp_enable = args.amp_enable;
 
-    ESBDecoder *decoder = new ESBDecoder(args.addr_byte_len, args.payload_len_bit_len, args.crc_byte_len, args.verbose);
+    Decoder *decoder = nullptr;
+    if (args.prot == protocol::ESB)
+    {
+        if (args.payload_len < 0)
+            decoder = new ESBDecoder(args.addr_byte_len, args.payload_len_bit_len, args.crc_byte_len, args.verbose);
+        else
+            decoder = new FixedESBDecoder(args.addr_byte_len, args.payload_len_bit_len, args.payload_len, args.crc_byte_len, args.verbose);
+    }
+    else
+    {
+        decoder = new SBDecoder(args.addr_byte_len, args.payload_len, args.crc_byte_len, args.verbose);
+    }
+
+    decoder->addr_filter = args.addr_filter;
+    decoder->filter_mask = args.filter_mask;
 
     if (source.run(rx_callback) != 0)
         return -1;
