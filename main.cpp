@@ -70,11 +70,8 @@ BOOL WINAPI sigint_callback_handler(int signum)
 #else
 void sigint_callback_handler(int signum)
 {
-    if (CTRL_C_EVENT == signum)
-    {
-        fprintf(stdout, "Caught signal %d\n", signum);
-        is_terminating = true;
-    }
+    fprintf(stdout, "Caught signal %d\n", signum);
+    is_terminating = true;
 }
 #endif
 
