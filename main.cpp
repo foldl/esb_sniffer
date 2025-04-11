@@ -561,7 +561,7 @@ public:
           verbose(verbose)
     {}
 
-    virtual void decode(const iq_comp_t *rxp_in, int buf_len) = 0;
+    virtual void decode(const iq_comp_t *rxp_in, int buf_len, int64_t sample_counter) = 0;
 
     virtual bool ignore_addr(const uint8_t *addr, int len)
     {
@@ -659,7 +659,7 @@ public:
     {
     }
 
-    void decode(const iq_comp_t *rxp_in, int buf_len) override
+    void decode(const iq_comp_t *rxp_in, int buf_len, int64_t sample_counter) override
     {
         const iq_comp_t *rxp = rxp_in;
 
@@ -741,7 +741,7 @@ public:
     {
     }
 
-    void decode(const iq_comp_t *rxp_in, int buf_len) override
+    void decode(const iq_comp_t *rxp_in, int buf_len, const int64_t sample_counter) override
     {
         const iq_comp_t *rxp = rxp_in;
 
@@ -798,9 +798,26 @@ public:
                 {
                     printf(": PID=%d NO_ACK=%d LEN=%03d DATA=", pid, no_ack, len);
                     disp_hex(payload, len);
+
+                    last_pack_pid     = pid;
+                    last_pack_end_pos = sample_counter + (rxp - rxp_in);
                 }
                 else
-                    printf(": PID=%d NO_ACK=%d ACK\n", pid, no_ack);
+                {
+                    printf(": PID=%d NO_ACK=%d ACK", pid, no_ack);
+
+                    if (last_pack_end_pos > 0)
+                    {
+                        int64_t pack_pos = sample_counter + (pkt_start - rxp_in);
+                        if (pid == last_pack_pid)
+                        {
+                            printf(" [+ %zd samples]", (pack_pos - last_pack_end_pos) / SAMPLE_PER_SYMBOL / 2);
+                        }
+                        last_pack_end_pos = 0;
+                    }
+
+                    printf("\n");
+                }
             }
             else
             {
@@ -820,6 +837,9 @@ protected:
     const int payload_len_bit_len; // {6, 8}
 
     uint8_t payload[300]; // payload and crc
+
+    int     last_pack_pid;
+    int64_t last_pack_end_pos = 0;
 
 protected:
 
@@ -842,7 +862,7 @@ public:
     {
     }
 
-    void decode(const iq_comp_t *rxp_in, int buf_len) override
+    void decode(const iq_comp_t *rxp_in, int buf_len, int64_t sample_counter) override
     {
         const iq_comp_t *rxp = rxp_in;
 
@@ -1222,13 +1242,16 @@ int main(int argc, char **argv)
     if (source.run(rx_callback) != 0)
         return -1;
 
+    int64_t sample_counter = 0;
+
     while (!is_terminating)
     {
         iq_comp_t *rxp = nullptr;
+        const int buf_offset = rx_buf_offset;
 
-        int offset = rx_buf_offset - LEN_BUF_OVERLAP;
+        int offset = buf_offset - LEN_BUF_OVERLAP;
 
-        if ((offset >= 0) && (rx_buf_offset < LEN_BUF / 2) && (phase == 1))
+        if ((offset >= 0) && (buf_offset < LEN_BUF / 2) && (phase == 1))
         {
             phase = 0;
             rxp = (iq_comp_t *)rx_buf + (LEN_BUF / 2);
@@ -1242,7 +1265,8 @@ int main(int argc, char **argv)
 
         if (rxp)
         {
-            decoder->decode(rxp, LEN_BUF / 2 + MAX_OVERLAP_SAMPLE);
+            decoder->decode(rxp, LEN_BUF / 2 + MAX_OVERLAP_SAMPLE, sample_counter);
+            sample_counter += LEN_BUF / 2 + MAX_OVERLAP_SAMPLE;
             fflush(stdout);
         }
     }
